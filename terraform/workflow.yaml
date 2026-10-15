@@ -340,10 +340,10 @@ main:
         assign:
           - parallelism: $${if(N > maxParallelism, maxParallelism, N)}
 
-    # Batch provisions floor(taskCount / taskCountPerNode) VMs, so a remainder
-    # waits for a free slot. Lower each candidate to the largest divisor of
-    # parallelism that keeps at least 3/4 of each VM busy, then try candidates
-    # that pack evenly first, keeping chain order within each group.
+    # A remainder leaves the last VM partly idle. Lower each candidate to the
+    # largest divisor of parallelism that keeps at least 3/4 of each VM busy,
+    # then try candidates that pack evenly first, keeping chain order within
+    # each group.
     - initialize_stageB_packing:
         assign:
           - evenCandidatesB: []
@@ -414,6 +414,11 @@ main:
                   # Clients compute how many tasks fit each candidate; older clients send none.
                   - candidateTaskCountPerNodeB: $${int(default(map.get(candidateB, "task_count_per_node"), taskCountPerNode))}
                   - candidateTaskCountPerNodeB: $${if(candidateTaskCountPerNodeB > N, N, candidateTaskCountPerNodeB)}
+                  # Batch provisions floor(min(parallelism, taskCount) / taskCountPerNode)
+                  # VMs. When every task runs at once, pad the task count to fill the
+                  # last VM; padded indices exit without work.
+                  - batchTaskCountB: $${if(parallelism == N, int((N + candidateTaskCountPerNodeB - 1) / candidateTaskCountPerNodeB) * candidateTaskCountPerNodeB, N)}
+                  - batchParallelismB: $${if(parallelism == N, batchTaskCountB, parallelism)}
                   - machineLabelB: $${if(candidateMachineTypeB == "", "auto", candidateMachineTypeB)}
                   - machineSelectionB: $${if(pinnedB, "pinned", "auto")}
                   - configuredCandidateInstancesB:
@@ -470,8 +475,8 @@ main:
                       profile: $${profileLabel}
                       billing_project: $${billingProjectLabel}
                     taskGroups:
-                      - taskCount: $${N}
-                        parallelism: $${parallelism}
+                      - taskCount: $${batchTaskCountB}
+                        parallelism: $${batchParallelismB}
                         taskCountPerNode: $${candidateTaskCountPerNodeB}
                         taskSpec:
                           runnables:
@@ -479,7 +484,8 @@ main:
                                 imageUri: $${resolvedImageB.uri}
                                 entrypoint: "/bin/bash"
                                 commands:
-                                  - "/scripts/run_runner.sh"
+                                  - "-c"
+                                  - "[ \"$BATCH_TASK_INDEX\" -ge \"$NUM_TASKS\" ] && exit 0; exec /scripts/run_runner.sh"
                           environment:
                             variables:
                               EXECUTION_MODE: "cloud"
@@ -488,6 +494,7 @@ main:
                               EXP_ID: $${expId}
                               RUN_ID: $${runId}
                               IMAGE_DIGEST: $${resolvedImageB.digest}
+                              NUM_TASKS: $${string(N)}
                               SKIP_EXISTING: $${if(ciB > 0, "true", "false")}
                               GITHUB_FORECAST_REPO: $${githubForecastRepo}
                               FORECAST_REPO_REF: $${forecastRepoRef}
@@ -536,8 +543,8 @@ main:
                   stage: B
                   candidateIndex: $${ciB}
                   numCandidates: $${numCandidatesB}
-                  expectedParallelism: $${parallelism}
-                  taskCount: $${N}
+                  expectedParallelism: $${batchParallelismB}
+                  taskCount: $${batchTaskCountB}
                   stallSeconds: $${watchdogStallSeconds}
                   zeroFillGraceSeconds: $${watchdogZeroFillGraceSeconds}
                   maxRunDurationSeconds: ${stage_b_max_run_duration}

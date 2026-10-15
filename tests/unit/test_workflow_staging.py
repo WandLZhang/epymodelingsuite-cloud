@@ -1,7 +1,9 @@
 """Regression tests for the staging workflow's staged rollout features."""
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -316,7 +318,7 @@ def test_wait_job_distinguishes_child_cancellation_from_failure(wait_job_source)
     ("stage", "parallelism", "task_count", "duration"),
     [
         ("A", "1", "1", "stage_a_max_run_duration"),
-        ("B", "$${parallelism}", "$${N}", "stage_b_max_run_duration"),
+        ("B", "$${batchParallelismB}", "$${batchTaskCountB}", "stage_b_max_run_duration"),
         ("C", "1", "1", "stage_c_max_run_duration"),
     ],
 )
@@ -465,6 +467,37 @@ def test_stage_b_packs_each_candidate_by_its_own_task_count(workflow_source):
     )
     assert "taskCountPerNode: $${candidateTaskCountPerNodeB}" in workflow_source
     assert "taskCountPerNode: $${taskCountPerNode}" not in workflow_source
+
+
+def test_stage_b_pads_task_count_to_fill_the_last_vm(workflow_source):
+    """Batch floors VMs per task count, so Stage B pads it and padded indices exit."""
+    select_source = workflow_source.split("- select_stageB_candidate:", maxsplit=1)[1].split(
+        "- resolve_stageB_image:", maxsplit=1
+    )[0]
+    create_source = workflow_source.split("- create_stageB_job:", maxsplit=1)[1].split(
+        "- finalize_stageB_candidate:", maxsplit=1
+    )[0]
+
+    assert (
+        "batchTaskCountB: $${if(parallelism == N, int((N + candidateTaskCountPerNodeB - 1)"
+        " / candidateTaskCountPerNodeB) * candidateTaskCountPerNodeB, N)}"
+    ) in select_source
+    assert (
+        "batchParallelismB: $${if(parallelism == N, batchTaskCountB, parallelism)}"
+        in select_source
+    )
+    assert "taskCount: $${batchTaskCountB}" in create_source
+    assert "parallelism: $${batchParallelismB}" in create_source
+    assert "NUM_TASKS: $${string(N)}" in create_source
+
+    guard = re.search(r'- "(\[ .*run_runner\.sh)"', create_source).group(1).replace('\\"', '"')
+    env = {"PATH": os.environ["PATH"], "NUM_TASKS": "51"}
+    padded = subprocess.run(["bash", "-c", guard], env={**env, "BATCH_TASK_INDEX": "51"})
+    real = subprocess.run(
+        ["bash", "-c", guard], env={**env, "BATCH_TASK_INDEX": "50"}, capture_output=True
+    )
+    assert padded.returncode == 0
+    assert real.returncode == 127  # reached exec of the (absent) runner script
 
 
 def test_stage_b_tries_evenly_packed_candidates_first(workflow_source):
