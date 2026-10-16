@@ -418,6 +418,8 @@ main:
                   # VMs. When every task runs at once, pad the task count to fill the
                   # last VM; padded indices exit without work.
                   - batchTaskCountB: $${if(parallelism == N, int((N + candidateTaskCountPerNodeB - 1) / candidateTaskCountPerNodeB) * candidateTaskCountPerNodeB, N)}
+                  # Keep valid jobs within Batch's fixed 5000-task parallelism limit.
+                  - batchTaskCountB: $${if(parallelism == N and batchTaskCountB > 5000, N, batchTaskCountB)}
                   - batchParallelismB: $${if(parallelism == N, batchTaskCountB, parallelism)}
                   - machineLabelB: $${if(candidateMachineTypeB == "", "auto", candidateMachineTypeB)}
                   - machineSelectionB: $${if(pinnedB, "pinned", "auto")}
@@ -430,6 +432,23 @@ main:
                             type: hyperdisk-balanced
                             sizeGb: 50
                   - candidateInstancesB: $${if(candidateMachineTypeB == "", autoInstances, configuredCandidateInstancesB)}
+
+            - warn_stageB_remainder:
+                switch:
+                  - condition: $${batchParallelismB % candidateTaskCountPerNodeB != 0}
+                    steps:
+                      - log_stageB_remainder:
+                          call: sys.log
+                          args:
+                            severity: WARNING
+                            json:
+                              message: "Stage B parallelism does not fill whole VMs; remainder tasks will wait for a free slot."
+                              candidate_index: $${ciB}
+                              machine_type: $${machineLabelB}
+                              task_count: $${batchTaskCountB}
+                              parallelism: $${batchParallelismB}
+                              task_count_per_node: $${candidateTaskCountPerNodeB}
+                              remainder_tasks: $${batchParallelismB % candidateTaskCountPerNodeB}
 
             - resolve_stageB_image:
                 call: resolveImage

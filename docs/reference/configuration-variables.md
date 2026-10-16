@@ -189,6 +189,8 @@ The 1024 MiB is left for the OS and container runtime when tasks share a VM (one
 
 **Even packing.** Batch provisions `floor(tasks / tasks per VM)` VMs, so a remainder would wait for a free slot. When every Stage B task runs at once, the workflow pads the Batch task count up to a multiple of the tasks per VM so the last VM starts too; padded task indices exit immediately (51 tasks at 2 per VM run as 52 Batch tasks on 26 VMs, and the status `TASKS` column counts the padded total). A remainder still leaves part of the last VM idle, so once Stage A has produced the tasks, the workflow lowers each candidate to the largest divisor of the Stage B parallelism that keeps at least 3/4 of its VM busy (51 tasks run at 3 per VM on 17 VMs). It then tries the candidates that pack evenly first, keeping `machine_types` order within each group.
 
+If padding would exceed Batch's fixed limit of 5,000 parallel tasks per job, the workflow keeps the original task count and parallelism. For example, 5,000 tasks at 3 per VM stay at 5,000, with 2 tasks waiting for a free slot. Whenever the resulting parallelism leaves a remainder, including when `max_parallelism` throttles the job, the workflow emits a `WARNING` with the candidate, task count, parallelism, tasks per VM, and remainder count before creating the Batch job.
+
 **Request one physical core per single-threaded task.** On Compute Engine a vCPU is one hardware thread, and two vCPUs share each physical core. Stage B calibration runs in one thread, so `cpu_milli: 1000` puts two tasks on each physical core. Measured on `c3d-standard-4` with the flu model:
 
 | `cpu_milli` | Tasks per `c3d-standard-4` | Time per task | Cost per task |

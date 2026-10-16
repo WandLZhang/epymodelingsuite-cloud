@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 WORKFLOW_STAGING = Path(__file__).resolve().parents[2] / "terraform" / "workflow-staging.yaml"
 WORKFLOW_STAGING_SUBWORKFLOWS = (
@@ -352,9 +353,9 @@ def test_each_stage_iterates_suffixed_candidates(workflow_source, stage):
 @pytest.mark.parametrize("stage", ["A", "B", "C"])
 def test_each_candidate_has_discovery_and_attribution_labels(workflow_source, stage):
     """Job and VM labels must identify the execution and selected candidate."""
-    stage_start = workflow_source.index(f"- run_stage{stage}_candidates:")
-    stage_end = workflow_source.find("# ========== STAGE", stage_start + 1)
-    stage_source = workflow_source[stage_start : stage_end if stage_end != -1 else None]
+    stage_source = workflow_source.split(f"- create_stage{stage}_job:", maxsplit=1)[1].split(
+        f"- finalize_stage{stage}_candidate:", maxsplit=1
+    )[0]
 
     assert stage_source.count("execution_id: $${executionIdShort}") == 2
     assert stage_source.count(f"candidate_index: $${{string(ci{stage})}}") == 2
@@ -498,6 +499,52 @@ def test_stage_b_pads_task_count_to_fill_the_last_vm(workflow_source):
     )
     assert padded.returncode == 0
     assert real.returncode == 127  # reached exec of the (absent) runner script
+
+
+@pytest.mark.parametrize("template", ["workflow.yaml", "workflow-staging.yaml"])
+@pytest.mark.parametrize(
+    ("n", "parallelism", "pack", "task_count", "batch_parallelism", "remainder"),
+    [
+        (1, 1, 1, 1, 1, 0),
+        (51, 51, 2, 52, 52, 0),
+        (51, 51, 3, 51, 51, 0),
+        (4999, 4999, 2, 5000, 5000, 0),
+        (4999, 4999, 3, 4999, 4999, 1),
+        (5000, 5000, 2, 5000, 5000, 0),
+        (5000, 5000, 3, 5000, 5000, 2),
+        (52, 51, 2, 52, 51, 1),
+        (10000, 5000, 3, 10000, 5000, 2),
+    ],
+)
+def test_stage_b_padding_limit_and_remainder_warning(
+    template, n, parallelism, pack, task_count, batch_parallelism, remainder
+):
+    """Evaluate the templates' expressions at the API limit and with throttled jobs."""
+    workflow = yaml.safe_load((WORKFLOW_STAGING.parent / template).read_text())
+    main_steps = {name: body for step in workflow["main"]["steps"] for name, body in step.items()}
+    steps = {
+        name: body
+        for step in main_steps["run_stageB_candidates"]["for"]["steps"]
+        for name, body in step.items()
+    }
+    values = {"N": n, "parallelism": parallelism, "candidateTaskCountPerNodeB": pack}
+    # These Workflows arithmetic expressions share Python syntax except for if().
+    functions = {"__builtins__": {}, "int": int, "choose": lambda c, a, b: a if c else b}
+    for assignment in steps["select_stageB_candidate"]["assign"]:
+        for name, expression in assignment.items():
+            if name in {"batchTaskCountB", "batchParallelismB"}:
+                values[name] = eval(expression[3:-1].replace("if(", "choose("), functions, values)
+
+    assert (values["batchTaskCountB"], values["batchParallelismB"]) == (
+        task_count,
+        batch_parallelism,
+    )
+    warning = steps["warn_stageB_remainder"]["switch"][0]
+    assert eval(warning["condition"][3:-1], functions, values) is (remainder > 0)
+    log = warning["steps"][0]["log_stageB_remainder"]
+    assert log["call"] == "sys.log"
+    assert log["args"]["severity"] == "WARNING"
+    assert eval(log["args"]["json"]["remainder_tasks"][3:-1], functions, values) == remainder
 
 
 def test_stage_b_tries_evenly_packed_candidates_first(workflow_source):
