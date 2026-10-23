@@ -479,13 +479,15 @@ class Run:
             "returnPartialSuccess": "true",
             "maxResults": 500,
         }
+        # Key by instance ID: a managed instance group retries a failed create under the
+        # same name, so one name can cover several VMs.
         seen = set()
         for items in self.api.paged(url, "items", params):
             for block in items.values():
                 for x in block.get("instances", []):
-                    name = x["name"]
-                    seen.add(name)
-                    rec = self.inst.get(name) or self._new_instance(x, now)
+                    vm_id = x["id"]
+                    seen.add(vm_id)
+                    rec = self.inst.get(vm_id) or self._new_instance(x, now)
                     rec["last_seen"] = iso(now)
                     if x.get("lastStartTimestamp"):
                         rec["last_start"] = x["lastStartTimestamp"]
@@ -493,15 +495,16 @@ class Run:
                         rec["status_first_seen"][x["status"]] = iso(now)
                         self.note(
                             kind="instance_status",
-                            name=name,
+                            id=vm_id,
+                            name=x["name"],
                             job=rec["job"],
                             status=x["status"],
                             last_start=rec["last_start"],
                         )
-        for name, rec in self.inst.items():
-            if name not in seen and not rec["gone_at"]:
+        for vm_id, rec in self.inst.items():
+            if vm_id not in seen and not rec["gone_at"]:
                 rec["gone_at"] = iso(now)
-                self.note(kind="instance_gone", name=name, job=rec["job"])
+                self.note(kind="instance_gone", id=vm_id, name=rec["name"], job=rec["job"])
 
     def _new_instance(self, x, now):
         labels = x.get("labels", {})
@@ -516,7 +519,8 @@ class Run:
                 ),
                 None,
             )
-        rec = self.inst[x["name"]] = {
+        rec = self.inst[x["id"]] = {
+            "id": x["id"],
             "name": x["name"],
             "job": job,
             "zone": x["zone"].rsplit("/", 1)[1],
@@ -531,6 +535,7 @@ class Run:
         }
         self.note(
             kind="instance_seen",
+            id=x["id"],
             name=x["name"],
             job=job,
             zone=rec["zone"],
@@ -680,6 +685,7 @@ class Run:
                     "zone": rec["zone"],
                     "machine_type": rec["machine_type"],
                     "instance": rec["name"],
+                    "instance_id": rec["id"],
                     "job_create_time": iso(ct),
                     "vm_created": rec["created"],
                     "vm_running": rec["last_start"] or "",
@@ -742,15 +748,23 @@ def write_csv(path, rows):
 
 
 def collect(args, log):
-    """Pull every VM insert for this pass from the Compute Engine audit log."""
+    """Pull this pass's VM inserts and deletes from the Compute Engine audit log.
+
+    Writes audit_entries.json (raw), audit_inserts.csv (one row per create attempt, keyed
+    by instance ID, since a managed instance group retries a failed create under the same
+    name), audit_insert_errors_by_type.csv, and audit_lifetimes.csv (each VM that started:
+    when its insert finished and when its delete was requested and finished).
+    """
     meta = json.load(open(os.path.join(args.out, "run.json")))
+    prefix = meta.get("prefix") or args.prefix
     start = parse_ts(meta["started"]) - dt.timedelta(minutes=2)
-    end = parse_ts(meta["finished"]) + dt.timedelta(minutes=2)
+    end = parse_ts(meta["finished"]) + dt.timedelta(minutes=10)
     project = meta["project"]
     flt = (
         f'logName="projects/{project}/logs/cloudaudit.googleapis.com%2Factivity" '
-        'AND resource.type="gce_instance" AND protoPayload.methodName:"instances.insert" '
-        f'AND protoPayload.resourceName:"{meta["prefix"]}-{meta["pass_id"]}-" '
+        'AND resource.type="gce_instance" AND (protoPayload.methodName:"instances.insert" '
+        'OR protoPayload.methodName:"instances.delete") '
+        f'AND protoPayload.resourceName:"{prefix}-{meta["pass_id"]}-" '
         f'AND timestamp>="{iso(start)}" AND timestamp<="{iso(end)}"'
     )
     log(f"filter: {flt}")
@@ -761,46 +775,64 @@ def collect(args, log):
         flt,
         f"--project={project}",
         "--format=json",
-        "--limit=100000",
+        "--limit=200000",
         "--order=asc",
     ]
     entries = json.loads(subprocess.check_output(cmd, text=True) or "[]")
-    with open(os.path.join(args.out, "audit_inserts.json"), "w") as f:
+    with open(os.path.join(args.out, "audit_entries.json"), "w") as f:
         json.dump(entries, f, indent=1)
-    rows = []
+    attempts = {}
     for e in entries:
         pp = e.get("protoPayload", {})
-        status = pp.get("status", {})
-        info = {}
-        for d in status.get("details", []):
-            for ei in d.get("value", {}).get("errorInfo", []):
-                info = {"reason": ei.get("reason", ""), **ei.get("metadata", {})}
-        rows.append(
+        labels = e.get("resource", {}).get("labels", {})
+        op = e.get("operation", {})
+        first = op.get("first", False) or not op.get("last", False)
+        last = op.get("last", False) or not op.get("first", False)
+        rec = attempts.setdefault(
+            labels.get("instance_id", ""),
             {
-                "timestamp": e.get("timestamp"),
-                "severity": e.get("severity"),
+                "instance_id": labels.get("instance_id", ""),
                 "instance": pp.get("resourceName", "").rsplit("/", 1)[-1],
-                "zone": e.get("resource", {}).get("labels", {}).get("zone"),
-                "first": e.get("operation", {}).get("first", False),
-                "last": e.get("operation", {}).get("last", False),
-                "status_code": status.get("code", ""),
-                "status_message": status.get("message", ""),
-                "error_reason": info.get("reason", ""),
-                "error_vm_type": info.get("vmType", ""),
-                "caller": pp.get("authenticationInfo", {}).get("principalEmail", ""),
-            }
+                "zone": labels.get("zone", ""),
+                "vm_type": "",
+                "insert_requested": "",
+                "insert_done": "",
+                "insert_status": "",
+                "error_reason": "",
+                "delete_requested": "",
+                "delete_done": "",
+            },
         )
+        if pp.get("methodName", "").endswith("instances.insert"):
+            machine = (pp.get("request") or {}).get("machineType", "")
+            rec["vm_type"] = rec["vm_type"] or machine.rsplit("/", 1)[-1]
+            if first:
+                rec["insert_requested"] = e.get("timestamp")
+            if last:
+                status = pp.get("status", {})
+                rec["insert_done"] = e.get("timestamp")
+                rec["insert_status"] = status.get("message") or "OK"
+                for d in status.get("details", []):
+                    for ei in d.get("value", {}).get("errorInfo", []):
+                        rec["error_reason"] = ei.get("reason", "")
+                        rec["vm_type"] = rec["vm_type"] or ei.get("metadata", {}).get("vmType", "")
+        elif pp.get("methodName", "").endswith("instances.delete"):
+            if first:
+                rec["delete_requested"] = e.get("timestamp")
+            if last:
+                rec["delete_done"] = e.get("timestamp")
+    rows = sorted(attempts.values(), key=lambda r: (r["insert_requested"] or "", r["instance"]))
     write_csv(os.path.join(args.out, "audit_inserts.csv"), rows)
-    errors = [r for r in rows if r["status_code"] not in ("", 0)]
-    log(f"{len(entries)} audit entries, {len(errors)} with an error status")
+    started = [r for r in rows if r["insert_status"] == "OK"]
+    write_csv(os.path.join(args.out, "audit_lifetimes.csv"), started)
+    errors = [r for r in rows if r["insert_status"] not in ("", "OK")]
+    log(
+        f"{len(entries)} audit entries: {len(rows)} create attempts, {len(started)} started, "
+        f"{len(errors)} failed"
+    )
     tally = {}
     for r in errors:
-        key = (
-            r["error_vm_type"] or r["instance"],
-            r["zone"],
-            r["status_message"],
-            r["error_reason"],
-        )
+        key = (r["vm_type"] or r["instance"], r["zone"], r["insert_status"], r["error_reason"])
         tally[key] = tally.get(key, 0) + 1
     with open(os.path.join(args.out, "audit_insert_errors_by_type.csv"), "w", newline="") as f:
         w = csv.writer(f)
@@ -850,6 +882,46 @@ def cleanup(args, log):
     log("WARNING: VMs still listed after 15 minutes")
 
 
+def fill(intervals, target):
+    """Peak VMs up at once, and seconds after submit until `target` were up at once.
+
+    `intervals` holds (start_s, end_s) per VM, in seconds after the job was created;
+    end_s is None for a VM still up when the record ends.
+    """
+    events = []
+    for start, end in intervals:
+        events.append((start, 1))
+        if end is not None:
+            events.append((end, -1))
+    events.sort(key=lambda e: (e[0], e[1]))
+    current = peak = 0
+    full_at = None
+    for t, step in events:
+        current += step
+        peak = max(peak, current)
+        if full_at is None and current >= target:
+            full_at = round(t, 1)
+    return peak, full_at
+
+
+def poll_intervals(vms, job_create):
+    """(start_s, end_s) per VM from the poll record, for passes without an audit pull."""
+    out = []
+    for r in vms:
+        start = parse_ts(r["vm_running"])
+        if not start:
+            continue
+        ends = [parse_ts(r["gone_poll"])]
+        for item in r["statuses_seen"].split():
+            status, _, when = item.partition("@")
+            if status in ("STOPPING", "TERMINATED"):
+                ends.append(parse_ts(when))
+        ends = [e for e in ends if e and e > start]
+        end = (min(ends) - job_create).total_seconds() if ends else None
+        out.append(((start - job_create).total_seconds(), end))
+    return out
+
+
 def pct(values, q):
     if not values:
         return ""
@@ -865,10 +937,41 @@ def summarize(args, log):
     insts = list(csv.DictReader(open(os.path.join(args.out, "instances.csv"))))
     audit_path = os.path.join(args.out, "audit_inserts.csv")
     audit = list(csv.DictReader(open(audit_path))) if os.path.exists(audit_path) else []
+    record_end = parse_ts(meta["finished"])
     rows, event_rows, task_rows = [], [], []
     for j in meta["jobs"]:
         mine = [r for r in insts if r["job"] == j["id"]]
-        run_s = [float(r["submit_to_running_s"]) for r in mine if r["submit_to_running_s"]]
+        job_create = parse_ts(j.get("create_time"))
+        # Batch names each VM <job uid>-group0-<n>-<suffix>.
+        prefix = j.get("uid")
+        attempts = [a for a in audit if prefix and a["instance"].startswith(prefix)]
+        started = [a for a in attempts if a["insert_status"] == "OK" and a["insert_done"]]
+        audit_err = [a for a in attempts if a["insert_status"] not in ("", "OK")]
+        vm_hours = usd = 0.0
+        if audit and job_create:
+            # The audit log has one record per VM even when a name is reused.
+            intervals = []
+            for a in started:
+                up = parse_ts(a["insert_done"])
+                down = parse_ts(a["delete_requested"])
+                gone = parse_ts(a["delete_done"]) or down or record_end
+                intervals.append(
+                    (
+                        (up - job_create).total_seconds(),
+                        (down - job_create).total_seconds() if down else None,
+                    )
+                )
+                hours = max(0.0, (gone - up).total_seconds()) / 3600
+                vm_hours += hours
+                usd += hours * PRICE.get(a["vm_type"], UNKNOWN_PRICE)
+                disk_from = parse_ts(a["insert_requested"]) or up
+                usd += max(0.0, (gone - disk_from).total_seconds()) / 3600 * DISK_PER_HOUR
+            run_s = sorted(start for start, _ in intervals)
+            zones = sorted({a["zone"] for a in started})
+        else:
+            intervals = poll_intervals(mine, job_create) if job_create else []
+            run_s = [float(r["submit_to_running_s"]) for r in mine if r["submit_to_running_s"]]
+            zones = sorted({r["zone"] for r in mine if r["vm_running"]})
         final_path = os.path.join(args.out, "jobs", f"{j['id']}.final.json")
         events = []
         if os.path.exists(final_path):
@@ -902,14 +1005,8 @@ def summarize(args, log):
         descriptions = [e.get("description", "") for e in events]
         exhausted = sum(1 for d in descriptions if "RESOURCE_POOL_EXHAUSTED" in d)
         quota = sum(1 for d in descriptions if "QUOTA" in d.upper())
-        # Batch names each VM <job uid>-group0-<n>-<suffix>.
-        prefix = j.get("uid")
-        audit_err = [
-            a
-            for a in audit
-            if prefix and a["instance"].startswith(prefix) and a["status_code"] not in ("", "0")
-        ]
         target = j["vms"]
+        peak, full_at = fill(intervals, target)
         rows.append(
             {
                 "region": j["region"],
@@ -919,35 +1016,44 @@ def summarize(args, log):
                 "tasks_per_vm": j["tasks_per_vm"],
                 "tasks": j["tasks"],
                 "job_vcpus": j["job_vcpus"],
-                "vms_running": len(run_s),
-                "fill_pct": round(100 * len(run_s) / target, 1) if target else "",
+                "vms_ever_running": len(run_s),
+                "peak_vms_running": peak,
+                "s_to_all_vms_running": "" if full_at is None else full_at,
                 "first_running_s": pct(run_s, 0),
                 "median_running_s": pct(run_s, 0.5),
                 "p90_running_s": pct(run_s, 0.9),
                 "last_running_s": pct(run_s, 1.0),
-                "zones": " ".join(sorted({r["zone"] for r in mine if r["vm_running"]})),
+                "zones": " ".join(zones),
                 "outcome": j["outcome"],
                 "batch_events_exhausted": exhausted,
                 "batch_events_quota": quota,
                 "audit_insert_errors": len(audit_err),
                 "audit_error_zones": " ".join(sorted({a["zone"] for a in audit_err})),
+                "vm_hours": round(vm_hours, 3) if audit else "",
+                "est_usd": round(usd, 2) if audit else "",
             }
         )
+    if audit:
+        total = sum(r["est_usd"] for r in rows)
+        hours = sum(r["vm_hours"] for r in rows)
+        log(f"estimated spend from the audit log: {hours:.1f} VM-hours, about ${total:.2f}")
     write_csv(os.path.join(args.out, "results.csv"), rows)
     write_csv(os.path.join(args.out, "job_events.csv"), event_rows)
     write_csv(os.path.join(args.out, "tasks.csv"), task_rows)
     lines = [
-        "| Region | Machine type | VMs RUNNING / target | Tasks per VM "
-        "| First / median / last VM RUNNING (s after submit) | Zones with VMs "
-        "| VM insert errors (zones) | Batch outcome |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Region | Machine type | Tasks per VM | Peak VMs RUNNING / target "
+        "| Seconds to all VMs RUNNING | First / median VM RUNNING (s) | VMs ever RUNNING "
+        "| Zones with VMs | VM insert errors (zones) | Batch outcome |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
+        full = r["s_to_all_vms_running"] or "never"
         lines.append(
-            f"| {r['region']} | `{r['machine_type']}` | {r['vms_running']} / {r['vms_target']} "
-            f"| {r['tasks_per_vm']} | {r['first_running_s']} / {r['median_running_s']} / "
-            f"{r['last_running_s']} | {r['zones']} | {r['audit_insert_errors']} "
-            f"({r['audit_error_zones']}) | {r['outcome']} |"
+            f"| {r['region']} | `{r['machine_type']}` | {r['tasks_per_vm']} "
+            f"| {r['peak_vms_running']} / {r['vms_target']} | {full} "
+            f"| {r['first_running_s']} / {r['median_running_s']} | {r['vms_ever_running']} "
+            f"| {r['zones']} | {r['audit_insert_errors']} ({r['audit_error_zones']}) "
+            f"| {r['outcome']} |"
         )
     with open(os.path.join(args.out, "results.md"), "w") as f:
         f.write("\n".join(lines) + "\n")
